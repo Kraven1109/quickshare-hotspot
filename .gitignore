@@ -1,0 +1,13 @@
+# Archives and scratch
+archive/
+.kilo/
+scratch/
+
+# Temporary and runtime files
+*.log
+*.bak
+*~
+.DS_Store
+
+# Quick share runtime temp
+/tmp/.qs_*
