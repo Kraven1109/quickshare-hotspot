@@ -27,6 +27,9 @@ This script automates that entire workflow:
 ```bash
 chmod +x quickshare-hotspot.sh
 ./quickshare-hotspot.sh
+
+# Optional: link to PATH for system-wide access
+ln -sf "$(pwd)/quickshare-hotspot.sh" ~/.local/bin/quickshare-hotspot
 ```
 
 ### Options
