@@ -333,11 +333,19 @@ cleanup() {
 
     info "Shutting down..."
 
-    # 1. Stop backend launched by this script
+    # 1. Stop backend launched by this script (bounded wait so SIGTERM delays never hang)
     local app_was_running=false
     if [ -n "$RQS_PID" ] && kill -0 "$RQS_PID" 2>/dev/null; then
         app_was_running=true
         kill "$RQS_PID" 2>/dev/null || true
+        local _w
+        for _w in 1 2 3 4 5 6 7 8 9 10; do
+            kill -0 "$RQS_PID" 2>/dev/null || break
+            sleep 0.2
+        done
+        if kill -0 "$RQS_PID" 2>/dev/null; then
+            kill -9 "$RQS_PID" 2>/dev/null || true
+        fi
         wait "$RQS_PID" 2>/dev/null || true
         if [ "$IS_FLATPAK" = true ]; then
             flatpak kill io.github.nozwock.Packet 2>/dev/null || true
@@ -352,22 +360,15 @@ cleanup() {
     fi
     rm -f "/tmp/.qs_hname.$$" 2>/dev/null || true
 
-    # 2. Tear down hotspot
+    # 2. Tear down hotspot (delete also deactivates in a single NM call)
     if [ "$HOTSPOT_CREATED" = true ]; then
-        nmcli con down "$HOTSPOT_CON" >/dev/null 2>&1 || true
         nmcli con delete "$HOTSPOT_CON" >/dev/null 2>&1 || true
         echo "  - Hotspot removed"
     fi
 
     # 3. Remove temporary firewall rules (unless --keep-rules)
-    if [ "$HAS_UFW" = true ] && [ "$KEEP_RULES" = false ]; then
-        if [ "$ADDED_UFW_RULE" = true ] && [ -n "$WIFI_IFACE" ]; then
-            sudo ufw delete allow in on "$WIFI_IFACE" >/dev/null 2>&1 || true
-        fi
-        # Clean up legacy rules if any were left behind from older runs
-        sudo ufw delete allow from "$HOTSPOT_SUBNET" >/dev/null 2>&1 || true
-        sudo ufw delete allow 5353/udp >/dev/null 2>&1 || true
-        sudo ufw reload >/dev/null 2>&1 || true
+    if [ "$HAS_UFW" = true ] && [ "$KEEP_RULES" = false ] && [ "$ADDED_UFW_RULE" = true ] && [ -n "$WIFI_IFACE" ]; then
+        sudo ufw delete allow in on "$WIFI_IFACE" >/dev/null 2>&1 || true
         echo "  - Temporary firewall rules removed"
     elif [ "$HAS_FIREWALLD" = true ] && [ "$KEEP_RULES" = false ] && [ "$ADDED_FIREWALLD_RULE" = true ] && [ -n "$WIFI_IFACE" ]; then
         if [ -n "$PREV_FIREWALLD_ZONE" ] && [ "$PREV_FIREWALLD_ZONE" != "trusted" ]; then
@@ -378,10 +379,14 @@ cleanup() {
         echo "  - Temporary firewalld zone restored"
     fi
 
-    # 4. Reconnect to previous Wi-Fi
+    # 4. Reconnect to previous Wi-Fi (bounded wait; skip if NM already reconnected)
     if [ -n "$PREV_WIFI" ]; then
-        echo "  - Reconnecting to '$PREV_WIFI'..."
-        nmcli con up "$PREV_WIFI" >/dev/null 2>&1 || true
+        if nmcli -t -f NAME con show --active 2>/dev/null | grep -Fxq "$PREV_WIFI"; then
+            echo "  - Already reconnected to '$PREV_WIFI'"
+        else
+            echo "  - Reconnecting to '$PREV_WIFI'..."
+            nmcli --wait 8 con up "$PREV_WIFI" >/dev/null 2>&1 || true
+        fi
     fi
 
     if [ "$HOTSPOT_CREATED" = true ]; then
