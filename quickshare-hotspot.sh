@@ -177,6 +177,7 @@ C_GREEN="\033[32m"
 C_BGREEN="\033[1;32m"
 C_YELLOW="\033[33m"
 C_BYELLOW="\033[1;33m"
+C_BRED="\033[1;31m"
 C_WHITE="\033[37m"
 C_BWHITE="\033[1;37m"
 
@@ -649,6 +650,11 @@ RQS_LOG=$(mktemp -t "quickshare-${SELECTED_BACKEND}.XXXXXX.log")
 if [ "$IS_FLATPAK" = true ]; then
     flatpak run io.github.nozwock.Packet >"$RQS_LOG" 2>&1 &
     RQS_PID=$!
+elif [ "$SELECTED_BACKEND" = "open-quickshare" ]; then
+    # Disable Open QuickShare's BLE send & L2CAP paths so it prefers our
+    # 5 GHz 80 MHz mDNS LAN instead of spawning its own 2.4 GHz hotspot.
+    PACKET_BLE_SEND=off PACKET_BLE_L2CAP=off "$APP_CMD" >"$RQS_LOG" 2>&1 &
+    RQS_PID=$!
 else
     "$APP_CMD" >"$RQS_LOG" 2>&1 &
     RQS_PID=$!
@@ -863,93 +869,115 @@ while true; do
     fi
 
     # Client detection:
-    # 1. Cheap check for connected Wi-Fi station MAC + real-time link bitrate & signal
-    station_info=$(iw dev "$WIFI_IFACE" station dump 2>/dev/null | awk '
-        /Station/ { mac=$2 }
-        /signal:/ { sig=$2 }
-        /rx bitrate:/ { rx_br=$3 }
-        /tx bitrate:/ { tx_br=$3 }
-        END {
-            br = (rx_br != "" ? rx_br : tx_br)
-            sub(/\..*/, "", br)
-            if (mac != "") print mac, (br != "" ? br : "-"), (sig != "" ? sig : "-")
-        }')
+    # 0. Verify interface is still in AP mode hosting our hotspot (detect hijacks
+    #    like Open QuickShare spawning packet-qs-hotspot or NM reconnecting STA)
+    ap_check=$(iw dev "$WIFI_IFACE" info 2>/dev/null | awk '
+        /type / { t=$2 }
+        /ssid / { sub(/^[[:space:]]*ssid[[:space:]]+/, ""); s=$0 }
+        END { print (t != "" ? t : "down") "\t" s }')
+    IFS=$'\t' read -r iface_type iface_ssid <<< "$ap_check"
 
-    new_station_mac=""
-    link_rate="-"
-    link_sig="-"
-    if [ -n "$station_info" ]; then
-        read -r new_station_mac link_rate link_sig <<< "$station_info"
-    fi
-
-    if [ -z "$new_station_mac" ]; then
+    if [ "$iface_type" != "AP" ] || { [ -n "$iface_ssid" ] && [ "$iface_ssid" != "$HOTSPOT_SSID" ]; }; then
         station_mac=""
         client_ip=""
         client_display=""
         cached_hname=""
-        icon="${C_BYELLOW}○${C_RESET}"
-        client_line="Waiting for phone..."
+        icon="${C_BRED}✖${C_RESET}"
+        client_line="AP lost (${iface_type:-down}${iface_ssid:+: $iface_ssid})"
+        if [ "${ap_lost_logged:-false}" = false ]; then
+            ap_lost_logged=true
+            log_permanent "[WARN] Hotspot '$HOTSPOT_SSID' lost (${iface_type:-down}${iface_ssid:+: $iface_ssid}). Press Ctrl+C and restart qsap."
+        fi
     else
-        # Station MAC associated
-        if [ "$new_station_mac" != "$station_mac" ]; then
-            station_mac="$new_station_mac"
+        ap_lost_logged=false
+        # 1. Cheap check for connected Wi-Fi station MAC + real-time link bitrate & signal
+        station_info=$(iw dev "$WIFI_IFACE" station dump 2>/dev/null | awk '
+            /Station/ { mac=$2 }
+            /signal:/ { sig=$2 }
+            /rx bitrate:/ { rx_br=$3 }
+            /tx bitrate:/ { tx_br=$3 }
+            END {
+                br = (rx_br != "" ? rx_br : tx_br)
+                sub(/\..*/, "", br)
+                if (mac != "") print mac, (br != "" ? br : "-"), (sig != "" ? sig : "-")
+            }')
+
+        new_station_mac=""
+        link_rate="-"
+        link_sig="-"
+        if [ -n "$station_info" ]; then
+            read -r new_station_mac link_rate link_sig <<< "$station_info"
+        fi
+
+        if [ -z "$new_station_mac" ]; then
+            station_mac=""
             client_ip=""
             client_display=""
             cached_hname=""
-        fi
-
-        # If IP not yet determined, retry lookups across sources until DHCP/ARP populates
-        if [ -z "$client_ip" ]; then
-            # Check ARP table by MAC
-            client_ip=$(awk -v mac="$station_mac" 'tolower($4)==tolower(mac) {print $1; exit}' /proc/net/arp 2>/dev/null)
-
-            # Check ARP table for any 10.42.* address on hotspot interface
-            [ -z "$client_ip" ] && client_ip=$(awk -v iface="$WIFI_IFACE" '$6==iface && $1 ~ /^10\.42\./ && $4 != "00:00:00:00:00:00" {print $1; exit}' /proc/net/arp 2>/dev/null)
-
-            # Check active TCP sockets to rquickshare (peer IP in column 5)
-            [ -z "$client_ip" ] && client_ip=$(ss -tn dst 10.42.0.0/24 2>/dev/null | awk 'NR>1 {split($5, a, ":"); if (a[1] != "") print a[1]; exit}')
-
-            # Check IP neighbor cache
-            [ -z "$client_ip" ] && client_ip=$(ip neigh show dev "$WIFI_IFACE" 2>/dev/null | awk '$1 ~ /^10\.42\./ && !/FAILED|INCOMPLETE/ {print $1; exit}')
-
-            if [ -n "$client_ip" ]; then
-                client_display="$client_ip"
-                # Resolve hostname asynchronously in background so loop never blocks
-                (
-                    hname=$(host -W 1 "$client_ip" 10.42.0.1 2>/dev/null | awk '/pointer/ {sub(/\.$/, "", $NF); print $NF; exit}')
-                    if [ -n "$hname" ] && [ "$hname" != "$client_ip" ]; then
-                        [ ${#hname} -gt 25 ] && hname="${hname:0:22}..."
-                        echo "$hname" > "/tmp/.qs_hname.$$"
-                    fi
-                ) &
-            fi
-        fi
-
-        # Check if background hostname resolution completed
-        if [ -n "$client_ip" ] && [ -f "/tmp/.qs_hname.$$" ]; then
-            read -r cached_hname < "/tmp/.qs_hname.$$" 2>/dev/null || true
-            rm -f "/tmp/.qs_hname.$$" 2>/dev/null || true
-            if [ -n "$cached_hname" ]; then
-                client_display="$client_ip ($cached_hname)"
-            fi
-        fi
-
-        if [ -n "$client_display" ]; then
-            icon="${C_BGREEN}●${C_RESET}"
-            dev_name="${cached_hname:-$client_ip}"
-            [ ${#dev_name} -gt 18 ] && dev_name="${dev_name:0:15}..."
-            if [ -n "$link_rate" ] && [ "$link_rate" != "-" ]; then
-                lna_warn=""
-                if [[ "$link_sig" =~ ^-[0-9]+$ ]] && (( link_sig > -30 )); then
-                    lna_warn=" !close"
-                fi
-                client_line="$dev_name · ${link_rate} Mbps (${link_sig}dBm${lna_warn})"
-            else
-                client_line="$client_display"
-            fi
+            icon="${C_BYELLOW}○${C_RESET}"
+            client_line="Waiting for phone..."
         else
-            icon="${C_BYELLOW}◐${C_RESET}"
-            client_line="Connecting..."
+            # Station MAC associated
+            if [ "$new_station_mac" != "$station_mac" ]; then
+                station_mac="$new_station_mac"
+                client_ip=""
+                client_display=""
+                cached_hname=""
+            fi
+
+            # If IP not yet determined, retry lookups across sources until DHCP/ARP populates
+            if [ -z "$client_ip" ]; then
+                # Check ARP table by MAC
+                client_ip=$(awk -v mac="$station_mac" 'tolower($4)==tolower(mac) {print $1; exit}' /proc/net/arp 2>/dev/null)
+
+                # Check ARP table for any 10.42.* address on hotspot interface
+                [ -z "$client_ip" ] && client_ip=$(awk -v iface="$WIFI_IFACE" '$6==iface && $1 ~ /^10\.42\./ && $4 != "00:00:00:00:00:00" {print $1; exit}' /proc/net/arp 2>/dev/null)
+
+                # Check active TCP sockets to rquickshare (peer IP in column 5)
+                [ -z "$client_ip" ] && client_ip=$(ss -tn dst 10.42.0.0/24 2>/dev/null | awk 'NR>1 {split($5, a, ":"); if (a[1] != "") print a[1]; exit}')
+
+                # Check IP neighbor cache
+                [ -z "$client_ip" ] && client_ip=$(ip neigh show dev "$WIFI_IFACE" 2>/dev/null | awk '$1 ~ /^10\.42\./ && !/FAILED|INCOMPLETE/ {print $1; exit}')
+
+                if [ -n "$client_ip" ]; then
+                    client_display="$client_ip"
+                    # Resolve hostname asynchronously in background so loop never blocks
+                    (
+                        hname=$(host -W 1 "$client_ip" 10.42.0.1 2>/dev/null | awk '/pointer/ {sub(/\.$/, "", $NF); print $NF; exit}')
+                        if [ -n "$hname" ] && [ "$hname" != "$client_ip" ]; then
+                            [ ${#hname} -gt 25 ] && hname="${hname:0:22}..."
+                            echo "$hname" > "/tmp/.qs_hname.$$"
+                        fi
+                    ) &
+                fi
+            fi
+
+            # Check if background hostname resolution completed
+            if [ -n "$client_ip" ] && [ -f "/tmp/.qs_hname.$$" ]; then
+                read -r cached_hname < "/tmp/.qs_hname.$$" 2>/dev/null || true
+                rm -f "/tmp/.qs_hname.$$" 2>/dev/null || true
+                if [ -n "$cached_hname" ]; then
+                    client_display="$client_ip ($cached_hname)"
+                fi
+            fi
+
+            if [ -n "$client_display" ]; then
+                icon="${C_BGREEN}●${C_RESET}"
+                dev_name="${cached_hname:-$client_ip}"
+                [ ${#dev_name} -gt 18 ] && dev_name="${dev_name:0:15}..."
+                if [ -n "$link_rate" ] && [ "$link_rate" != "-" ]; then
+                    lna_warn=""
+                    if [[ "$link_sig" =~ ^-[0-9]+$ ]] && (( link_sig > -30 )); then
+                        lna_warn=" !close"
+                    fi
+                    client_line="$dev_name · ${link_rate} Mbps (${link_sig}dBm${lna_warn})"
+                else
+                    client_line="$client_display"
+                fi
+            else
+                icon="${C_BYELLOW}◐${C_RESET}"
+                client_line="Connecting..."
+            fi
         fi
     fi
 
