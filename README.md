@@ -30,13 +30,15 @@ This script automates the entire workflow:
 
 ```bash
 chmod +x quickshare-hotspot.sh
-./quickshare-hotspot.sh
 
-# Random per-session password (great with QR scanning)
-./quickshare-hotspot.sh --random-pass
+# Install globally as `qsap` (callable from any directory / shell)
+ln -sf "$(pwd)/quickshare-hotspot.sh" ~/.local/bin/qsap
 
-# Optional: link to PATH for system-wide access
-ln -sf "$(pwd)/quickshare-hotspot.sh" ~/.local/bin/quickshare-hotspot
+# Start 5 GHz 80 MHz hotspot with QR + random per-session password
+qsap
+
+# Or reuse fixed password so your phone auto-connects without scanning QR
+qsap --fixed-pass
 ```
 
 ### Options
@@ -46,7 +48,8 @@ ln -sf "$(pwd)/quickshare-hotspot.sh" ~/.local/bin/quickshare-hotspot
   --2g, --2ghz         Force 2.4 GHz band
   --ssid <name>        Custom hotspot SSID (default: QS-Laptop)
   --pass <password>    Custom WPA2 password (>= 8 chars)
-  --random-pass        Generate a random per-session WPA2 password
+  --random-pass        Generate a random per-session WPA2 password (default)
+  --fixed-pass         Use fixed default password instead of random
   --open-quickshare    Force Open QuickShare backend (--rquickshare alias)
   --packet             Force Packet backend (Rust / GTK4)
   --backend <name>     Select backend: auto (default), open-quickshare, packet

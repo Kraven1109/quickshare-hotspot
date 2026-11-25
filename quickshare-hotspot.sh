@@ -8,11 +8,11 @@
 # forces 5 GHz 80 MHz (~80–90+ MB/s) and handles UFW/firewalld automatically.
 #
 # Usage:
-#   ./quickshare-hotspot.sh                   # Auto backend (favours Open QuickShare)
-#   ./quickshare-hotspot.sh --open-quickshare # Force Open QuickShare backend
-#   ./quickshare-hotspot.sh --packet          # Force Packet backend (Rust / GTK4)
-#   ./quickshare-hotspot.sh --random-pass     # Random per-session WPA2 password
-#   ./quickshare-hotspot.sh --keep-rules      # Keep firewall rules after exit
+#   qsap                      # Default: 5 GHz 80 MHz, Open QuickShare, QR + random password
+#   qsap --fixed-pass         # Reuse default fixed password (for auto-reconnecting phones)
+#   qsap --packet             # Force Packet backend (Rust / GTK4)
+#   qsap --ssid MyNet --pass mysecret123
+#   qsap --keep-rules         # Keep firewall rules after exit
 #
 # Press Ctrl+C when done to cleanly restore previous state.
 
@@ -37,7 +37,7 @@ TRANSFER_THRESHOLD=100000          # bytes/sec floor for "actively transferring"
 IDLE_CONFIRM_TICKS=6               # ticks (0.5s each = 3s) of low speed before closing a burst
 SHOW_QR=true
 QR_MARGIN=2                        # QR quiet zone: must be even (2 = balanced & fully framed, 4 = large)
-RANDOM_PASS=false
+RANDOM_PASS=true                   # Random per-session WPA2 password by default (secure with QR)
 HAS_UFW=false
 ADDED_UFW_RULE=false
 HAS_FIREWALLD=false
@@ -62,8 +62,9 @@ while [ $# -gt 0 ]; do
         --open-quickshare) BACKEND="open-quickshare"; shift ;;
         --rquickshare)     BACKEND="open-quickshare"; shift ;;
         --packet)          BACKEND="packet"; shift ;;
-        --no-qr)       SHOW_QR=false; shift ;;
-        --random-pass) RANDOM_PASS=true; shift ;;
+        --no-qr)           SHOW_QR=false; shift ;;
+        --random-pass)     RANDOM_PASS=true; shift ;;
+        --fixed-pass)      RANDOM_PASS=false; shift ;;
         --ssid)
             if [ -n "${2:-}" ]; then
                 HOTSPOT_SSID="$2"
@@ -125,7 +126,8 @@ while [ $# -gt 0 ]; do
             echo "  --2g, --2ghz         Force 2.4 GHz band"
             echo "  --ssid <name>        Custom hotspot SSID (default: QS-Laptop)"
             echo "  --pass <password>    Custom WPA2 password (>= 8 chars)"
-            echo "  --random-pass        Generate a random per-session WPA2 password"
+            echo "  --random-pass        Generate a random per-session WPA2 password (default)"
+            echo "  --fixed-pass         Use fixed default password instead of random"
             echo "  --open-quickshare    Use Open QuickShare backend (recommended; --rquickshare alias)"
             echo "  --packet             Use Packet backend (Rust / GTK4)"
             echo "  --backend <name>     Select backend: auto (default), open-quickshare, packet"
