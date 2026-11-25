@@ -1,16 +1,18 @@
 #!/usr/bin/env bash
 #
-# quickshare-hotspot.sh — One-command Quick Share via Linux Wi-Fi hotspot
+# quickshare-hotspot.sh — High-speed 5 GHz (80 MHz) hotspot wrapper for Open QuickShare & Packet
 #
-# Creates a temporary Wi-Fi hotspot on this machine, configures the firewall,
-# and launches rquickshare or Packet. Any phone with Quick Share support can connect
-# and transfer files at full local Wi-Fi speed — no router needed.
+# Creates a temporary 5 GHz 80 MHz Wi-Fi hotspot on Linux, configures the firewall,
+# and launches Open QuickShare (or Packet / legacy rquickshare). While Open QuickShare
+# has built-in hotspot support, it defaults to 2.4 GHz (~5–15 MB/s); this wrapper
+# forces 5 GHz 80 MHz (~80–90+ MB/s) and handles UFW/firewalld automatically.
 #
 # Usage:
-#   ./quickshare-hotspot.sh              # Auto backend (favours native rquickshare)
-#   ./quickshare-hotspot.sh --packet     # Force Packet backend (Rust / GTK4)
-#   ./quickshare-hotspot.sh --rquickshare# Force rquickshare backend
-#   ./quickshare-hotspot.sh --keep-rules # Keep UFW rules after exit
+#   ./quickshare-hotspot.sh                   # Auto backend (favours Open QuickShare)
+#   ./quickshare-hotspot.sh --open-quickshare # Force Open QuickShare backend
+#   ./quickshare-hotspot.sh --packet          # Force Packet backend (Rust / GTK4)
+#   ./quickshare-hotspot.sh --random-pass     # Random per-session WPA2 password
+#   ./quickshare-hotspot.sh --keep-rules      # Keep firewall rules after exit
 #
 # Press Ctrl+C when done to cleanly restore previous state.
 
@@ -25,7 +27,7 @@ HOTSPOT_PASS="quickshare24"        # WPA requires >= 8 chars
 HOTSPOT_CON="qs-hotspot"           # NM connection profile name (internal)
 HOTSPOT_SUBNET="10.42.0.0/24"     # NM default for shared connections
 RQS_BIN="/usr/bin/rquickshare"
-BACKEND="auto"                     # "auto" (favours rquickshare), "rquickshare", or "packet"
+BACKEND="auto"                     # "auto" (favours Open QuickShare), "open-quickshare", "rquickshare", or "packet"
 SELECTED_BACKEND=""
 APP_CMD=""
 APP_NAME=""
@@ -57,8 +59,9 @@ while [ $# -gt 0 ]; do
         --keep-rules)  KEEP_RULES=true; shift ;;
         --2g|--2ghz)   FORCE_BAND="2"; shift ;;
         --5g|--5ghz)   FORCE_BAND="5"; shift ;;
-        --rquickshare) BACKEND="rquickshare"; shift ;;
-        --packet)      BACKEND="packet"; shift ;;
+        --open-quickshare) BACKEND="open-quickshare"; shift ;;
+        --rquickshare)     BACKEND="open-quickshare"; shift ;;
+        --packet)          BACKEND="packet"; shift ;;
         --no-qr)       SHOW_QR=false; shift ;;
         --random-pass) RANDOM_PASS=true; shift ;;
         --ssid)
@@ -107,7 +110,7 @@ while [ $# -gt 0 ]; do
                 BACKEND="$2"
                 shift 2
             else
-                echo "[ERROR] --backend requires an argument (auto, rquickshare, packet)" >&2
+                echo "[ERROR] --backend requires an argument (auto, open-quickshare, packet)" >&2
                 exit 1
             fi
             ;;
@@ -123,9 +126,9 @@ while [ $# -gt 0 ]; do
             echo "  --ssid <name>        Custom hotspot SSID (default: QS-Laptop)"
             echo "  --pass <password>    Custom WPA2 password (>= 8 chars)"
             echo "  --random-pass        Generate a random per-session WPA2 password"
-            echo "  --rquickshare        Use rquickshare backend (CachyOS native)"
+            echo "  --open-quickshare    Use Open QuickShare backend (recommended; --rquickshare alias)"
             echo "  --packet             Use Packet backend (Rust / GTK4)"
-            echo "  --backend <name>     Select backend: auto (default), rquickshare, packet"
+            echo "  --backend <name>     Select backend: auto (default), open-quickshare, packet"
             echo "  --no-qr              Do not display Wi-Fi QR code"
             echo "  --qr-margin <N>      Set QR margin width (even integer, default: 2)"
             echo "  --keep-rules         Keep temporary firewall rules after exit"
@@ -175,6 +178,45 @@ C_BYELLOW="\033[1;33m"
 C_WHITE="\033[37m"
 C_BWHITE="\033[1;37m"
 
+# Detect Open QuickShare (standalone binary, packaged /usr/bin/rquickshare, or AppImage)
+# Falls back to legacy rquickshare if installed.
+resolve_open_quickshare() {
+    if command -v open-quickshare >/dev/null 2>&1; then
+        SELECTED_BACKEND="open-quickshare"
+        APP_CMD="$(command -v open-quickshare)"
+        APP_NAME="Open QuickShare"
+        return 0
+    fi
+    if [ -x "$RQS_BIN" ] || command -v rquickshare >/dev/null 2>&1; then
+        SELECTED_BACKEND="open-quickshare"
+        if [ -x "$RQS_BIN" ]; then
+            APP_CMD="$RQS_BIN"
+        else
+            APP_CMD="$(command -v rquickshare)"
+        fi
+        if [ -f "/usr/share/applications/open-quickshare.desktop" ] \
+           || pacman -Qq open-quickshare-bin >/dev/null 2>&1 \
+           || pacman -Qq open-quickshare >/dev/null 2>&1; then
+            SELECTED_BACKEND="open-quickshare"
+            APP_NAME="Open QuickShare"
+        else
+            SELECTED_BACKEND="rquickshare"
+            APP_NAME="rquickshare (legacy)"
+        fi
+        return 0
+    fi
+    local appimg
+    for appimg in "$HOME/.local/bin"/open-quickshare*.AppImage "$HOME/Applications"/open-quickshare*.AppImage; do
+        if [ -x "$appimg" ]; then
+            SELECTED_BACKEND="open-quickshare"
+            APP_CMD="$appimg"
+            APP_NAME="Open QuickShare (AppImage)"
+            return 0
+        fi
+    done
+    return 1
+}
+
 # ── Preflight checks ────────────────────────────────────────────────────────
 preflight() {
     local missing=()
@@ -182,15 +224,9 @@ preflight() {
 
     case "$BACKEND" in
         auto)
-            # Favour rquickshare because it is natively packaged on CachyOS
-            if [ -x "$RQS_BIN" ] || command -v rquickshare >/dev/null 2>&1; then
-                SELECTED_BACKEND="rquickshare"
-                if [ -x "$RQS_BIN" ]; then
-                    APP_CMD="$RQS_BIN"
-                else
-                    APP_CMD="$(command -v rquickshare)"
-                fi
-                APP_NAME="rquickshare"
+            # Favour Open QuickShare (packaged as /usr/bin/rquickshare on AUR/deb/rpm)
+            if resolve_open_quickshare; then
+                :
             elif command -v packet >/dev/null 2>&1; then
                 SELECTED_BACKEND="packet"
                 APP_CMD="packet"
@@ -201,20 +237,12 @@ preflight() {
                 APP_NAME="Packet (Flatpak)"
                 IS_FLATPAK=true
             else
-                missing+=("Quick Share backend: 'rquickshare' (paru -S r-quick-share) or 'packet' (paru -S packet)")
+                missing+=("Quick Share backend: 'open-quickshare' (paru -S open-quickshare-bin) or 'packet' (paru -S packet)")
             fi
             ;;
-        rquickshare)
-            if [ -x "$RQS_BIN" ] || command -v rquickshare >/dev/null 2>&1; then
-                SELECTED_BACKEND="rquickshare"
-                if [ -x "$RQS_BIN" ]; then
-                    APP_CMD="$RQS_BIN"
-                else
-                    APP_CMD="$(command -v rquickshare)"
-                fi
-                APP_NAME="rquickshare"
-            else
-                missing+=("rquickshare ($RQS_BIN) - install with 'paru -S r-quick-share'")
+        open-quickshare|rquickshare)
+            if ! resolve_open_quickshare; then
+                missing+=("open-quickshare - install with 'paru -S open-quickshare-bin'")
             fi
             ;;
         packet)
@@ -232,7 +260,7 @@ preflight() {
             fi
             ;;
         *)
-            die "Invalid backend '$BACKEND'. Choose 'auto', 'rquickshare', or 'packet'."
+            die "Invalid backend '$BACKEND'. Choose 'auto', 'open-quickshare', or 'packet'."
             ;;
     esac
 
@@ -378,12 +406,16 @@ nmcli con down "$HOTSPOT_CON" 2>/dev/null || true
 nmcli con delete "$HOTSPOT_CON" 2>/dev/null || true
 
 # 3. Stop any existing backend (it needs to restart to bind the hotspot interface)
-if [ "$SELECTED_BACKEND" = "rquickshare" ]; then
-    if pgrep -x "rquickshare" >/dev/null 2>&1; then
-        info "Stopping existing rquickshare..."
-        pkill -x "rquickshare" 2>/dev/null || true
-        sleep 2
-    fi
+if [ "$SELECTED_BACKEND" = "open-quickshare" ] || [ "$SELECTED_BACKEND" = "rquickshare" ]; then
+    local_stopped=false
+    for proc_name in open-quickshare rquickshare; do
+        if pgrep -x "$proc_name" >/dev/null 2>&1; then
+            info "Stopping existing $proc_name..."
+            pkill -x "$proc_name" 2>/dev/null || true
+            local_stopped=true
+        fi
+    done
+    [ "$local_stopped" = true ] && sleep 2
 elif [ "$SELECTED_BACKEND" = "packet" ]; then
     local_stopped=false
     if pgrep -x "packet" >/dev/null 2>&1; then

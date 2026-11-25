@@ -32,23 +32,24 @@
 
 ### Network Layer
 - **NetworkManager Profile:** Uses a temporary profile (`qs-hotspot`) with `ipv4.method=shared` on subnet `10.42.0.0/24`. NetworkManager runs an internal `dnsmasq` instance for DHCP leases.
-- **Firewall (UFW / iptables):** When UFW is active, incoming traffic on the hotspot interface (`$WIFI_IFACE`) is temporarily allowed. Legacy specific rules (5353/udp, 10.42.0.0/24) are cleaned up during teardown.
+- **Firewall (UFW / firewalld):** When UFW is active, incoming traffic on the hotspot interface (`$WIFI_IFACE`) is temporarily allowed; legacy specific rules (5353/udp, 10.42.0.0/24) are cleaned up during teardown. When `firewalld` is active instead, `$WIFI_IFACE` is temporarily placed in the `trusted` zone and restored to its previous zone on exit.
 - **Cleanup Trap:** The script installs a strict trap on `INT`, `TERM`, `EXIT`. When invoked, it:
   1. Terminates the spawned Quick Share process.
   2. Deletes the `qs-hotspot` NetworkManager connection.
-  3. Deletes temporary firewall rules.
+  3. Deletes temporary firewall rules / restores `firewalld` zone.
   4. Automatically reconnects to the pre-existing Wi-Fi connection (`PREV_WIFI`).
 
 ### Traffic Measurement Engine
 - **Kernel Polling:** Throughput is sampled directly from `/sys/class/net/$WIFI_IFACE/statistics/{rx,tx}_bytes`.
 - **Timing Accuracy:** Sampling delta is measured using nanosecond timers (`date +%s%N`). Rates are calculated as `delta_bytes / dt_seconds` as floating-point / millisecond calculations, preventing integer division spikes.
-- **Burst Smoothing:** A 3-tick idle confirmation window (`IDLE_CONFIRM_TICKS=3`) ensures transfers with minor pauses are not prematurely logged as multiple fragmented sessions.
-- **Non-blocking Station Query:** Station MAC, RSSI, and TX/RX link bitrates are gathered via `iw dev $WIFI_IFACE station dump`. Client IP/hostname lookup is cached and resolved asynchronously in a background subshell so the 1-second TUI tick is never delayed.
+- **Burst Smoothing:** A 6-tick idle confirmation window (`IDLE_CONFIRM_TICKS=6` at 0.5s ticks = 3.0s) ensures transfers with minor pauses are not prematurely logged as multiple fragmented sessions.
+- **Non-blocking Station Query:** Station MAC, RSSI, and TX/RX link bitrates are gathered via `iw dev $WIFI_IFACE station dump`. Client IP/hostname lookup is cached and resolved asynchronously in a background subshell so the TUI tick is never delayed.
 
 ### Quick Share Backends
-- **`rquickshare`:** Default / native CachyOS & Arch implementation (`cachyos/r-quick-share`).
+- **`open-quickshare` (Primary / Recommended):** Actively maintained full-stack fork (`ignotusbucius/open-quickshare`, AUR: `open-quickshare-bin`, packaged as `/usr/bin/rquickshare` or AppImage). Although it has built-in hotspot support, its `start_hotspot()` hardcodes 2.4 GHz (`band bg`), so this wrapper pre-creates a 5 GHz 80 MHz LAN (`10.42.0.0/24`) for full ~80–90+ MB/s throughput.
 - **`Packet`:** Alternative GTK4 / libadwaita client (`nozwock/packet`), supported via native binary (`packet`) or Flatpak (`io.github.nozwock.Packet`).
-- Both backends leverage the `rqs_lib` core Rust crate and listen on mDNS `5353/udp` and dynamically allocated TCP sockets.
+- **`rquickshare` (Legacy):** Original `Martichou/rquickshare` remains supported transparently via `/usr/bin/rquickshare`.
+- All backends leverage the `rqs_lib` core Rust crate and listen on mDNS `5353/udp` and dynamically allocated TCP sockets.
 
 ---
 
@@ -58,7 +59,7 @@
    - Do **NOT** enable `set -e` in `quickshare-hotspot.sh`. Many probing operations (`nmcli`, `iw`, `pgrep`, `ss`) intentionally return non-zero exit codes during initial environment detection. `set -e` triggers premature exit and fires the cleanup trap unexpectedly.
 
 2. **Preserve Variable Initialization:**
-   - Since `set -uo pipefail` is enforced, all variables checked in `cleanup()` (`HAS_UFW`, `ADDED_UFW_RULE`, `HOTSPOT_CREATED`, `WIFI_IFACE`, `PREV_WIFI`, `RQS_PID`, `RQS_LOG`) **must** be initialized with safe default values at the top of the script.
+   - Since `set -uo pipefail` is enforced, all variables checked in `cleanup()` (`HAS_UFW`, `ADDED_UFW_RULE`, `HAS_FIREWALLD`, `ADDED_FIREWALLD_RULE`, `PREV_FIREWALLD_ZONE`, `HOTSPOT_CREATED`, `WIFI_IFACE`, `PREV_WIFI`, `RQS_PID`, `RQS_LOG`, `CLEANED_UP`, `TERM_RESIZED`) **must** be initialized with safe default values at the top of the script.
 
 3. **QR Code Formatting Invariant:**
    - In terminal half-block rendering (`ANSIUTF8`), each character row contains 2 vertical module pixels.
