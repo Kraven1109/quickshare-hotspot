@@ -32,17 +32,22 @@ APP_NAME=""
 IS_FLATPAK=false
 UFW_RULE_COMMENT="qs-hotspot-temp"
 TRANSFER_THRESHOLD=100000          # bytes/sec floor for "actively transferring"
-IDLE_CONFIRM_TICKS=3               # ticks of low speed before closing a burst
+IDLE_CONFIRM_TICKS=6               # ticks (0.5s each = 3s) of low speed before closing a burst
 SHOW_QR=true
-QR_MARGIN=2                        # QR quiet zone: 2 = balanced & fully framed (17 lines), 4 = large
+QR_MARGIN=2                        # QR quiet zone: must be even (2 = balanced & fully framed, 4 = large)
+RANDOM_PASS=false
 HAS_UFW=false
 ADDED_UFW_RULE=false
+HAS_FIREWALLD=false
+ADDED_FIREWALLD_RULE=false
+PREV_FIREWALLD_ZONE=""
 HOTSPOT_CREATED=false
 WIFI_IFACE=""
 PREV_WIFI=""
 RQS_PID=""
 RQS_LOG=""
 CLEANED_UP=false
+TERM_RESIZED=false
 
 # ── Argument parsing ─────────────────────────────────────────────────────────
 KEEP_RULES=false
@@ -55,12 +60,41 @@ while [ $# -gt 0 ]; do
         --rquickshare) BACKEND="rquickshare"; shift ;;
         --packet)      BACKEND="packet"; shift ;;
         --no-qr)       SHOW_QR=false; shift ;;
+        --random-pass) RANDOM_PASS=true; shift ;;
+        --ssid)
+            if [ -n "${2:-}" ]; then
+                HOTSPOT_SSID="$2"
+                shift 2
+            else
+                echo "[ERROR] --ssid requires a network name" >&2
+                exit 1
+            fi
+            ;;
+        --ssid=*)
+            HOTSPOT_SSID="${1#*=}"
+            shift
+            ;;
+        --pass)
+            if [ -n "${2:-}" ]; then
+                HOTSPOT_PASS="$2"
+                RANDOM_PASS=false
+                shift 2
+            else
+                echo "[ERROR] --pass requires a password (>= 8 chars)" >&2
+                exit 1
+            fi
+            ;;
+        --pass=*)
+            HOTSPOT_PASS="${1#*=}"
+            RANDOM_PASS=false
+            shift
+            ;;
         --qr-margin)
             if [ -n "${2:-}" ]; then
                 QR_MARGIN="$2"
                 shift 2
             else
-                echo "[ERROR] --qr-margin requires a number (e.g. 1, 2, 4)" >&2
+                echo "[ERROR] --qr-margin requires an even number (e.g. 2, 4)" >&2
                 exit 1
             fi
             ;;
@@ -86,17 +120,43 @@ while [ $# -gt 0 ]; do
             echo "Options:"
             echo "  --5g, --5ghz         Force 5 GHz band"
             echo "  --2g, --2ghz         Force 2.4 GHz band"
+            echo "  --ssid <name>        Custom hotspot SSID (default: QS-Laptop)"
+            echo "  --pass <password>    Custom WPA2 password (>= 8 chars)"
+            echo "  --random-pass        Generate a random per-session WPA2 password"
             echo "  --rquickshare        Use rquickshare backend (CachyOS native)"
             echo "  --packet             Use Packet backend (Rust / GTK4)"
             echo "  --backend <name>     Select backend: auto (default), rquickshare, packet"
             echo "  --no-qr              Do not display Wi-Fi QR code"
-            echo "  --qr-margin <N>      Set QR margin width (default: 2, balanced)"
-            echo "  --keep-rules         Keep UFW rules after exit"
+            echo "  --qr-margin <N>      Set QR margin width (even integer, default: 2)"
+            echo "  --keep-rules         Keep temporary firewall rules after exit"
             exit 0
             ;;
         *) echo "Unknown argument: $1"; exit 1 ;;
     esac
 done
+
+# Validate QR_MARGIN (must be a positive even integer for ANSIUTF8 half-block rendering)
+if ! [[ "$QR_MARGIN" =~ ^[0-9]+$ ]] || (( QR_MARGIN < 2 )); then
+    echo "[ERROR] --qr-margin must be an even integer >= 2 (got '$QR_MARGIN')" >&2
+    exit 1
+elif (( QR_MARGIN % 2 != 0 )); then
+    echo "[WARN] --qr-margin must be even for half-block QR alignment; adjusting $QR_MARGIN -> $(( QR_MARGIN + 1 ))" >&2
+    QR_MARGIN=$(( QR_MARGIN + 1 ))
+fi
+
+# Generate random per-session password if requested
+if [ "$RANDOM_PASS" = true ]; then
+    HOTSPOT_PASS=$(LC_ALL=C tr -dc 'A-HJ-NP-Za-km-z2-9' </dev/urandom | head -c 12 || true)
+    if [ "${#HOTSPOT_PASS}" -lt 8 ]; then
+        HOTSPOT_PASS="qs$(date +%s%N | tail -c 10)"
+    fi
+fi
+
+# Validate WPA2 password length
+if [ "${#HOTSPOT_PASS}" -lt 8 ] || [ "${#HOTSPOT_PASS}" -gt 63 ]; then
+    echo "[ERROR] Hotspot password must be 8-63 characters (got ${#HOTSPOT_PASS})" >&2
+    exit 1
+fi
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 die()  { echo "[ERROR] $*" >&2; exit 1; }
@@ -125,7 +185,11 @@ preflight() {
             # Favour rquickshare because it is natively packaged on CachyOS
             if [ -x "$RQS_BIN" ] || command -v rquickshare >/dev/null 2>&1; then
                 SELECTED_BACKEND="rquickshare"
-                APP_CMD="${RQS_BIN:-rquickshare}"
+                if [ -x "$RQS_BIN" ]; then
+                    APP_CMD="$RQS_BIN"
+                else
+                    APP_CMD="$(command -v rquickshare)"
+                fi
                 APP_NAME="rquickshare"
             elif command -v packet >/dev/null 2>&1; then
                 SELECTED_BACKEND="packet"
@@ -143,7 +207,11 @@ preflight() {
         rquickshare)
             if [ -x "$RQS_BIN" ] || command -v rquickshare >/dev/null 2>&1; then
                 SELECTED_BACKEND="rquickshare"
-                APP_CMD="${RQS_BIN:-rquickshare}"
+                if [ -x "$RQS_BIN" ]; then
+                    APP_CMD="$RQS_BIN"
+                else
+                    APP_CMD="$(command -v rquickshare)"
+                fi
                 APP_NAME="rquickshare"
             else
                 missing+=("rquickshare ($RQS_BIN) - install with 'paru -S r-quick-share'")
@@ -201,31 +269,30 @@ preflight() {
     [ "$ap_ok" = true ] \
         || die "Wi-Fi adapter ($WIFI_IFACE) does not support AP (hotspot) mode"
 
-    # Detect ufw
+    # Detect active firewall (ufw or firewalld)
     HAS_UFW=false
+    HAS_FIREWALLD=false
     if command -v ufw >/dev/null 2>&1; then
         if sudo ufw status 2>/dev/null | head -1 | grep -q "active"; then
             HAS_UFW=true
         fi
     fi
+    if [ "$HAS_UFW" = false ] && command -v firewall-cmd >/dev/null 2>&1; then
+        if firewall-cmd --state 2>/dev/null | grep -q "running"; then
+            HAS_FIREWALLD=true
+        fi
+    fi
 
     # Prompt for sudo early if we need it
-    if [ "$HAS_UFW" = true ]; then
+    if [ "$HAS_UFW" = true ] || [ "$HAS_FIREWALLD" = true ]; then
         sudo -v || die "sudo access required for firewall configuration"
     fi
 }
 
-# ── State tracking ───────────────────────────────────────────────────────────
-RQS_PID=""
-RQS_LOG=""
-PREV_WIFI=""
-ADDED_UFW_RULE=false
-CLEANED_UP=false
-
 # ── Cleanup (runs on Ctrl+C, SIGTERM, or normal exit) ────────────────────────
 cleanup() {
     # Unset traps to prevent recursion
-    trap - INT TERM EXIT
+    trap - INT TERM EXIT WINCH
     [ "$CLEANED_UP" = true ] && exit 0
     CLEANED_UP=true
 
@@ -259,7 +326,7 @@ cleanup() {
         echo "  - Hotspot removed"
     fi
 
-    # 3. Remove temporary UFW rules (unless --keep-rules)
+    # 3. Remove temporary firewall rules (unless --keep-rules)
     if [ "$HAS_UFW" = true ] && [ "$KEEP_RULES" = false ]; then
         if [ "$ADDED_UFW_RULE" = true ] && [ -n "$WIFI_IFACE" ]; then
             sudo ufw delete allow in on "$WIFI_IFACE" >/dev/null 2>&1 || true
@@ -269,6 +336,13 @@ cleanup() {
         sudo ufw delete allow 5353/udp >/dev/null 2>&1 || true
         sudo ufw reload >/dev/null 2>&1 || true
         echo "  - Temporary firewall rules removed"
+    elif [ "$HAS_FIREWALLD" = true ] && [ "$KEEP_RULES" = false ] && [ "$ADDED_FIREWALLD_RULE" = true ] && [ -n "$WIFI_IFACE" ]; then
+        if [ -n "$PREV_FIREWALLD_ZONE" ] && [ "$PREV_FIREWALLD_ZONE" != "trusted" ]; then
+            sudo firewall-cmd --zone="$PREV_FIREWALLD_ZONE" --change-interface="$WIFI_IFACE" >/dev/null 2>&1 || true
+        else
+            sudo firewall-cmd --zone=trusted --remove-interface="$WIFI_IFACE" >/dev/null 2>&1 || true
+        fi
+        echo "  - Temporary firewalld zone restored"
     fi
 
     # 4. Reconnect to previous Wi-Fi
@@ -305,9 +379,9 @@ nmcli con delete "$HOTSPOT_CON" 2>/dev/null || true
 
 # 3. Stop any existing backend (it needs to restart to bind the hotspot interface)
 if [ "$SELECTED_BACKEND" = "rquickshare" ]; then
-    if pgrep -f "rquickshare" >/dev/null 2>&1; then
+    if pgrep -x "rquickshare" >/dev/null 2>&1; then
         info "Stopping existing rquickshare..."
-        pkill -f "rquickshare" 2>/dev/null || true
+        pkill -x "rquickshare" 2>/dev/null || true
         sleep 2
     fi
 elif [ "$SELECTED_BACKEND" = "packet" ]; then
@@ -328,9 +402,9 @@ fi
 # Give the interface time to stabilize after cleanup
 sleep 1
 
-# 4. Configure firewall (only if ufw is active)
+# 4. Configure firewall (if ufw or firewalld is active)
 if [ "$HAS_UFW" = true ]; then
-    info "Configuring firewall for hotspot on $WIFI_IFACE..."
+    info "Configuring UFW firewall for hotspot on $WIFI_IFACE..."
 
     # Allow all incoming packets on the hotspot interface.
     # This is required so:
@@ -343,6 +417,15 @@ if [ "$HAS_UFW" = true ]; then
 
     sudo ufw reload >/dev/null
     ok "Firewall ready (traffic on $WIFI_IFACE allowed)"
+elif [ "$HAS_FIREWALLD" = true ]; then
+    info "Configuring firewalld for hotspot on $WIFI_IFACE..."
+    PREV_FIREWALLD_ZONE=$(sudo firewall-cmd --get-zone-of-interface="$WIFI_IFACE" 2>/dev/null || true)
+    if [ "$PREV_FIREWALLD_ZONE" != "trusted" ]; then
+        if sudo firewall-cmd --zone=trusted --change-interface="$WIFI_IFACE" >/dev/null 2>&1; then
+            ADDED_FIREWALLD_RULE=true
+        fi
+    fi
+    ok "Firewall ready ($WIFI_IFACE in trusted zone)"
 fi
 
 # 5. Create Wi-Fi hotspot
@@ -366,15 +449,18 @@ elif [ "$FORCE_BAND" = "5" ]; then
     HOTSPOT_ATTEMPTS=(
         "5GHz-ch149-80MHz a 149 80"
         "5GHz-ch149-40MHz a 149 40"
+        "5GHz-ch36-80MHz  a 36  80"
         "5GHz-ch149       a 149 0"
         "5GHz-ch36        a 36  0"
     )
 else
-    # Default: Try 5GHz on UNII-3 channel 149 with 80MHz width, then 40MHz, 20MHz/auto, then 2.4GHz
+    # Default: Try 5GHz on UNII-3 ch 149 (80/40MHz), UNII-1 ch 36 (80MHz), 20MHz/auto, then 2.4GHz
     HOTSPOT_ATTEMPTS=(
         "5GHz-ch149-80MHz a 149 80"
         "5GHz-ch149-40MHz a 149 40"
+        "5GHz-ch36-80MHz  a 36  80"
         "5GHz-ch149       a 149 0"
+        "5GHz-ch36        a 36  0"
         "2.4GHz-auto      bg 0   0"
     )
 fi
@@ -624,10 +710,15 @@ cached_hname=""
 # When a transfer completes: log_permanent erases the dashboard, prints the completed
 # log into terminal scrollback, and leaves the new dashboard to draw cleanly below it.
 prev_drawn_lines=0
+trap 'TERM_RESIZED=true' WINCH
 
 render_dashboard() {
     local -a lines=("$@")
-    if (( prev_drawn_lines > 0 )); then
+    if [ "$TERM_RESIZED" = true ]; then
+        TERM_RESIZED=false
+        prev_drawn_lines=0
+        echo ""
+    elif (( prev_drawn_lines > 0 )); then
         printf '\033[%dA\033[J' "$prev_drawn_lines"
     fi
     printf '%s\n' "${lines[@]}"
@@ -810,9 +901,13 @@ while true; do
         if [ -n "$client_display" ]; then
             icon="${C_BGREEN}●${C_RESET}"
             dev_name="${cached_hname:-$client_ip}"
-            [ ${#dev_name} -gt 22 ] && dev_name="${dev_name:0:19}..."
+            [ ${#dev_name} -gt 18 ] && dev_name="${dev_name:0:15}..."
             if [ -n "$link_rate" ] && [ "$link_rate" != "-" ]; then
-                client_line="$dev_name · Link: ${link_rate} Mbps (${link_sig}dBm)"
+                lna_warn=""
+                if [[ "$link_sig" =~ ^-[0-9]+$ ]] && (( link_sig > -30 )); then
+                    lna_warn=" !close"
+                fi
+                client_line="$dev_name · ${link_rate} Mbps (${link_sig}dBm${lna_warn})"
             else
                 client_line="$client_display"
             fi
