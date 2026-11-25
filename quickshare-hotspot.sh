@@ -331,7 +331,9 @@ cleanup() {
     info "Shutting down..."
 
     # 1. Stop backend launched by this script
+    local app_was_running=false
     if [ -n "$RQS_PID" ] && kill -0 "$RQS_PID" 2>/dev/null; then
+        app_was_running=true
         kill "$RQS_PID" 2>/dev/null || true
         wait "$RQS_PID" 2>/dev/null || true
         if [ "$IS_FLATPAK" = true ]; then
@@ -339,8 +341,8 @@ cleanup() {
         fi
         echo "  - $APP_NAME stopped"
     fi
-    # Keep the launch log only if it actually has content worth checking.
-    if [ -n "$RQS_LOG" ] && [ -s "$RQS_LOG" ]; then
+    # Keep the launch log only if the backend failed/crashed and wrote output.
+    if [ "$app_was_running" = false ] && [ -n "$RQS_LOG" ] && [ -s "$RQS_LOG" ]; then
         echo "  - $APP_NAME log kept at: $RQS_LOG"
     elif [ -n "$RQS_LOG" ]; then
         rm -f "$RQS_LOG" 2>/dev/null || true
