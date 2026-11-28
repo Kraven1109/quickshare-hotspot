@@ -480,6 +480,52 @@ fi
 info "Starting Wi-Fi hotspot on $WIFI_IFACE..."
 BAND_USED=""
 
+# Query 5 GHz channels currently allowed for standalone AP mode (no `no IR`,
+# `disabled`, or `radar detection`). Returns space-padded list like " 149 36 "
+# or empty string; sets HAS_5GHZ_BAND=true if any 5 GHz channel exists.
+HAS_5GHZ_BAND=false
+ALLOWED_5GHZ_CHANNELS=""
+query_5ghz_ap_channels() {
+    HAS_5GHZ_BAND=false
+    ALLOWED_5GHZ_CHANNELS=""
+    command -v iw >/dev/null 2>&1 || return 0
+    local out
+    out=$(iw list 2>/dev/null | awk '
+        /^[[:space:]]*\* [0-9]+(\.[0-9]+)? MHz \[[0-9]+\]/ {
+            freq = $2 + 0
+            if (freq >= 5000 && freq < 5900) {
+                has5 = 1
+                low = tolower($0)
+                if (low !~ /disabled|no ir|radar detection/) {
+                    ch = $4
+                    gsub(/[^0-9]/, "", ch)
+                    if (ch != "") allowed = allowed " " ch
+                }
+            }
+        }
+        END { print (has5 ? "1" : "0") "|" allowed }')
+    if [ "${out%%|*}" = "1" ]; then
+        HAS_5GHZ_BAND=true
+    fi
+    local chs="${out#*|}"
+    [ -n "$chs" ] && ALLOWED_5GHZ_CHANNELS="${chs} "
+}
+
+if [ "$FORCE_BAND" != "2" ]; then
+    query_5ghz_ap_channels
+    if [ "$HAS_5GHZ_BAND" = true ] \
+       && [[ "$ALLOWED_5GHZ_CHANNELS" != *" 149 "* ]] \
+       && [[ "$ALLOWED_5GHZ_CHANNELS" != *" 36 "* ]]; then
+        info "  5 GHz AP channels restricted (no IR); rescanning to wake regulatory domain (LAR)..."
+        nmcli --wait 4 device wifi rescan ifname "$WIFI_IFACE" >/dev/null 2>&1 || true
+        sleep 1
+        query_5ghz_ap_channels
+        if [[ "$ALLOWED_5GHZ_CHANNELS" == *" 149 "* ]] || [[ "$ALLOWED_5GHZ_CHANNELS" == *" 36 "* ]]; then
+            ok "  5 GHz AP channels unlocked after rescan:${ALLOWED_5GHZ_CHANNELS}"
+        fi
+    fi
+fi
+
 # Configure candidate band/channel attempts
 # Note: NetworkManager defaults wifi.channel-width to 0 (auto = 20 MHz safest/smallest),
 # which caps throughput at ~15 MB/s. Explicitly setting width=80 enables full 802.11ac/ax
@@ -509,6 +555,15 @@ fi
 
 for attempt in "${HOTSPOT_ATTEMPTS[@]}"; do
     read -r label band channel width <<< "$attempt"
+
+    # Skip restricted (no IR) 5 GHz channels in auto mode to avoid 25s NM retries
+    if [ "$band" = "a" ] && [ "$FORCE_BAND" != "5" ] && [ "$HAS_5GHZ_BAND" = true ]; then
+        if [[ "$ALLOWED_5GHZ_CHANNELS" != *" ${channel} "* ]]; then
+            info "  Skipping $label (ch $channel restricted by no-IR/regdom)"
+            continue
+        fi
+    fi
+
     info "  Trying $label (band=$band, channel=$channel, width=${width:-auto})..."
 
     # Remove any leftover from a failed attempt
@@ -540,8 +595,11 @@ for attempt in "${HOTSPOT_ATTEMPTS[@]}"; do
         fi
     fi
 
+    wait_sec=8
+    [ "$band" = "a" ] && wait_sec=4
+
     if nmcli connection add "${add_args[@]}" 2>/dev/null \
-       && nmcli connection up "$HOTSPOT_CON" 2>/dev/null; then
+       && nmcli --wait "$wait_sec" connection up "$HOTSPOT_CON" 2>/dev/null; then
         # nmcli can report success even when the driver silently drops back
         # out of AP mode a moment later (seen on some Intel cards under
         # regulatory constraints), so confirm the interface is actually
