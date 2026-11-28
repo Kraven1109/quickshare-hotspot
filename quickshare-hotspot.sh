@@ -452,7 +452,7 @@ if [ "$HAS_UFW" = true ]; then
     # This is required so:
     #   1. DHCP discover (UDP 67 from 0.0.0.0) is NOT blocked by UFW default deny policy
     #   2. DNS (53), mDNS (5353), and rquickshare dynamic transfer ports are allowed
-    if ! sudo ufw status | grep -q "${WIFI_IFACE}.*ALLOW"; then
+    if ! sudo ufw status | grep -qE "^Anywhere on ${WIFI_IFACE}[[:space:]]+ALLOW"; then
         sudo ufw allow in on "$WIFI_IFACE" comment "$UFW_RULE_COMMENT" >/dev/null
         ADDED_UFW_RULE=true
     fi
